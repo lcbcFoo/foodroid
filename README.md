@@ -1,6 +1,10 @@
 # Android CLI Tools
 
-CLI helpers for Android development without Android Studio. Currently includes `do` for ADB + Gradle + logcat automation.
+CLI helpers for Android development without Android Studio.
+
+## Contents
+- `foodroid`: ADB + Gradle + logcat automation
+- `logq`: interactive log viewer (tail + filters + color)
 
 ## Assumptions
 - Python 3.10+ is available.
@@ -12,7 +16,7 @@ CLI helpers for Android development without Android Studio. Currently includes `
 - Your Android project uses a standard `app/` module with `app/build.gradle.kts` (KTS) or `app/build.gradle` (Groovy).
 
 ## Project Selection
-`do` targets a project root using this order:
+`foodroid` and `logq` target a project root using this order:
 1. `--project /path/to/project`
 2. `ANDROID_PROJECT_ROOT` or `DO_PROJECT_ROOT`
 3. Current working directory (or a parent) containing `settings.gradle(.kts)` and `app/build.gradle(.kts)`
@@ -20,27 +24,41 @@ CLI helpers for Android development without Android Studio. Currently includes `
 Per‑project state is stored in `<project>/.android-dev.json` (add it to your project `.gitignore`).
 Log files default to `<project>/logs/`.
 
+
+## Install
+Use Make to install to a system prefix (default: `/usr/local/bin`).
+
+```bash
+sudo make install
+# or to install to ~/.local/bin
+make install PREFIX=$HOME/.local
+```
+
+To uninstall:
+```bash
+sudo make uninstall
+```
+
 ## Usage
 From your project root, or pass `--project` explicitly:
 
 ```bash
-/home/foo/workspace/android-cli-tools/do doctor
-/home/foo/workspace/android-cli-tools/do pair <ip:port> <code>
-/home/foo/workspace/android-cli-tools/do connect <ip:port>
-/home/foo/workspace/android-cli-tools/do device set <serial>
-/home/foo/workspace/android-cli-tools/do install
-/home/foo/workspace/android-cli-tools/do run
-/home/foo/workspace/android-cli-tools/do logcat
-/home/foo/workspace/android-cli-tools/do up
+./foodroid doctor
+./foodroid pair <ip:port> <code>
+./foodroid connect <ip:port>
+./foodroid device set <serial>
+./foodroid install
+./foodroid run
+./foodroid logcat
+./foodroid up
 ```
 
 Logcat options:
 ```bash
-/home/foo/workspace/android-cli-tools/do logcat --all
-/home/foo/workspace/android-cli-tools/do logcat --crash
-/home/foo/workspace/android-cli-tools/do logcat --out logs/session.txt
+./foodroid logcat --all
+./foodroid logcat --crash
+./foodroid logcat --out logs/session.txt
 ```
-
 
 ## Log Parser (logq)
 `logq` tails a log file and provides interactive filtering with colorized levels.
@@ -52,8 +70,8 @@ Default behavior:
 
 Basic usage:
 ```bash
-/home/foo/workspace/android-cli-tools/logq --project /path/to/project
-/home/foo/workspace/android-cli-tools/logq /path/to/log.txt
+./logq --project /path/to/project
+./logq /path/to/log.txt
 ```
 
 Key bindings:
@@ -64,13 +82,13 @@ Key bindings:
 - `t` set tag filter
 - `l` set level filter (e.g. W, E, I+, VDI)
 - `/` set text filter
-- `c` clear filters
+- `c` clear filters (keeps package)
+- `C` clear all
 - `?` help
 
-
 ## Notes
-- `do install` and `do up` respect the configured device via `ANDROID_SERIAL`.
-- `do logcat` writes to a default timestamped file under `logs/` and opens `logq` for interactive viewing (falls back to raw stream if `logq` is missing).
+- `foodroid install` and `foodroid up` respect the configured device via `ANDROID_SERIAL`.
+- `foodroid logcat` writes to a default timestamped file under `logs/` and opens `logq` for interactive viewing (falls back to raw stream if `logq` is missing).
 
 ## Dependencies
 Install Python deps if needed:

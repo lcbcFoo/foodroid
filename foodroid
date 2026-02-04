@@ -431,7 +431,7 @@ def command_device_auto(_args):
     if len(devices) == 0:
         eprint("No connected devices.")
         return 1
-    eprint("Multiple devices connected. Use: do device set <serial>")
+        eprint("Multiple devices connected. Use: foodroid device set <serial>")
     return 1
 
 
@@ -553,7 +553,7 @@ def command_up(args):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="do")
+    parser = argparse.ArgumentParser(prog="foodroid")
     parser.add_argument(
         "--project",
         help="path to Android project root (defaults to cwd or ANDROID_PROJECT_ROOT)",
