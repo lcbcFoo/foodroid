@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import time
+import tty
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from queue import Queue
+from threading import Event, Thread
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+except ImportError:
+    print("Missing dependency: rich. Install with: pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1)
+
+
+TOOL_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = None
+LOG_DIR = None
+CONFIG_PATH = None
+
+LOG_RE = re.compile(
+    r"^(?P<date>\d\d-\d\d)\s+"
+    r"(?P<time>\d\d:\d\d:\d\d\.\d+)\s+"
+    r"(?P<pid>\d+)\s+(?P<tid>\d+)\s+"
+    r"(?P<level>[VDIWEF])\s+"
+    r"(?P<tag>[^:]+):\s(?P<msg>.*)$"
+)
+
+LEVEL_ORDER = {"V": 0, "D": 1, "I": 2, "W": 3, "E": 4, "F": 5}
+LEVEL_STYLES = {
+    "V": "dim",
+    "D": "cyan",
+    "I": "green",
+    "W": "yellow",
+    "E": "red",
+    "F": "bold red",
+}
+
+
+@dataclass
+class LogEntry:
+    raw: str
+    level: str
+    tag: str
+    pid: str
+    tid: str
+    message: str
+
+
+class TerminalMode:
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = None
+        self.enabled = False
+
+    def enable(self):
+        if self.enabled:
+            return
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self.enabled = True
+
+    def disable(self):
+        if not self.enabled:
+            return
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        self.enabled = False
+
+
+class State:
+    def __init__(self):
+        self.paused = False
+        self.paused_snapshot = None
+        self.show_help = False
+        self.package_enabled = False
+        self.package_name = None
+        self.package_pids = set()
+        self.package_last_refresh = 0.0
+        self.package_refresh_sec = 3.0
+
+        self.level_mode = None
+        self.level_value = None
+        self.level_set = None
+
+        self.tag_filter = None
+        self.tag_is_regex = False
+        self.text_filter = None
+        self.text_is_regex = False
+
+
+def resolve_project_root(cli_value=None):
+    if cli_value:
+        return Path(cli_value).expanduser().resolve()
+    for key in ("ANDROID_PROJECT_ROOT", "DO_PROJECT_ROOT"):
+        value = os.environ.get(key)
+        if value:
+            return Path(value).expanduser().resolve()
+    cwd = Path.cwd()
+    markers = [
+        ("settings.gradle.kts", "app/build.gradle.kts"),
+        ("settings.gradle", "app/build.gradle"),
+    ]
+    for base in [cwd] + list(cwd.parents):
+        for settings, appbuild in markers:
+            if (base / settings).exists() and (base / appbuild).exists():
+                return base
+    return cwd
+
+
+def set_project_root(cli_value=None):
+    global PROJECT_ROOT, LOG_DIR, CONFIG_PATH
+    PROJECT_ROOT = resolve_project_root(cli_value)
+    LOG_DIR = PROJECT_ROOT / "logs"
+    CONFIG_PATH = PROJECT_ROOT / ".android-dev.json"
+
+
+def project_root():
+    if PROJECT_ROOT is None:
+        set_project_root(None)
+    return PROJECT_ROOT
+
+
+def config_path():
+    if CONFIG_PATH is None:
+        set_project_root(None)
+    return CONFIG_PATH
+
+
+def log_dir():
+    if LOG_DIR is None:
+        set_project_root(None)
+    return LOG_DIR
+
+
+def load_config():
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def read_sdk_dir():
+    for key in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    local_props = project_root() / "local.properties"
+    if local_props.exists():
+        for line in local_props.read_text().splitlines():
+            if line.startswith("sdk.dir="):
+                return line.split("=", 1)[1].strip()
+    return None
+
+
+def adb_path():
+    env_adb = os.environ.get("ADB")
+    if env_adb:
+        return env_adb
+    sdk = read_sdk_dir()
+    if sdk:
+        candidate = Path(sdk) / "platform-tools" / "adb"
+        if candidate.exists():
+            return str(candidate)
+    return "adb"
+
+
+def adb_cmd(args):
+    cmd = [adb_path()]
+    cfg = load_config()
+    serial = cfg.get("device_serial") or os.environ.get("ANDROID_SERIAL")
+    if serial:
+        cmd += ["-s", serial]
+    cmd += args
+    return cmd
+
+
+def app_id():
+    root = project_root()
+    build_file = root / "app" / "build.gradle.kts"
+    if build_file.exists():
+        text = build_file.read_text()
+        match = re.search(r'^\s*applicationId\s*=\s*"([^"]+)"', text, re.M)
+        return match.group(1) if match else None
+    build_file = root / "app" / "build.gradle"
+    if build_file.exists():
+        text = build_file.read_text()
+        match = re.search(r'^\s*applicationId\s+"([^"]+)"', text, re.M)
+        return match.group(1) if match else None
+    return None
+
+
+def parse_line(line, last_entry=None):
+    m = LOG_RE.match(line)
+    if m:
+        return LogEntry(
+            raw=line,
+            level=m.group("level"),
+            tag=m.group("tag"),
+            pid=m.group("pid"),
+            tid=m.group("tid"),
+            message=m.group("msg"),
+        )
+    if last_entry:
+        return LogEntry(
+            raw=line,
+            level=last_entry.level,
+            tag=last_entry.tag,
+            pid=last_entry.pid,
+            tid=last_entry.tid,
+            message=line,
+        )
+    return LogEntry(raw=line, level="?", tag="", pid="", tid="", message=line)
+
+
+def format_entry(entry):
+    style = LEVEL_STYLES.get(entry.level)
+    if style:
+        return Text(entry.raw, style=style)
+    return Text(entry.raw)
+
+
+def compile_filter(text):
+    if not text:
+        return None, False
+    text = text.strip()
+    if len(text) >= 2 and text.startswith("/") and text.endswith("/"):
+        try:
+            return re.compile(text[1:-1]), True
+        except re.error:
+            return text, False
+    return text, False
+
+
+def parse_level_filter(text):
+    if not text:
+        return None, None, None
+    raw = text.strip().upper()
+    if not raw:
+        return None, None, None
+    if raw.startswith(">="):
+        raw = raw[2:]
+    if raw.endswith("+"):
+        raw = raw[:-1]
+    raw = raw.replace(" ", "")
+    if "," in raw:
+        levels = {c for c in raw.split(",") if c in LEVEL_ORDER}
+        return "set", None, levels
+    if len(raw) > 1:
+        levels = {c for c in raw if c in LEVEL_ORDER}
+        if levels:
+            return "set", None, levels
+    if raw in LEVEL_ORDER:
+        return "min", raw, None
+    return None, None, None
+
+
+def matches_level(entry, state):
+    if state.level_mode is None:
+        return True
+    if entry.level not in LEVEL_ORDER:
+        return False
+    if state.level_mode == "min":
+        return LEVEL_ORDER[entry.level] >= LEVEL_ORDER[state.level_value]
+    if state.level_mode == "set":
+        return entry.level in state.level_set
+    return True
+
+
+def matches_tag(entry, state):
+    if not state.tag_filter:
+        return True
+    tag = entry.tag or ""
+    if state.tag_is_regex:
+        return bool(state.tag_filter.search(tag))
+    return state.tag_filter.lower() in tag.lower()
+
+
+def matches_text(entry, state):
+    if not state.text_filter:
+        return True
+    msg = entry.message or entry.raw
+    if state.text_is_regex:
+        return bool(state.text_filter.search(msg))
+    return state.text_filter.lower() in msg.lower()
+
+
+def refresh_package_pids(state):
+    if not state.package_enabled or not state.package_name:
+        return
+    now = time.time()
+    if now - state.package_last_refresh < state.package_refresh_sec:
+        return
+    state.package_last_refresh = now
+    try:
+        result = subprocess.run(
+            adb_cmd(["shell", "pidof", state.package_name]),
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            pids = result.stdout.strip().split()
+            state.package_pids = set(pids)
+        else:
+            state.package_pids = set()
+    except OSError:
+        state.package_pids = set()
+
+
+def matches_package(entry, state):
+    if not state.package_enabled:
+        return True
+    if not state.package_pids:
+        return False
+    return entry.pid in state.package_pids
+
+
+def matches(entry, state):
+    return (
+        matches_level(entry, state)
+        and matches_tag(entry, state)
+        and matches_text(entry, state)
+        and matches_package(entry, state)
+    )
+
+
+def status_line(state, total_count, shown_count):
+    parts = [f"lines:{total_count}", f"shown:{shown_count}"]
+    if state.paused:
+        parts.append("paused")
+    if state.package_enabled:
+        pid_part = ",".join(sorted(state.package_pids)) if state.package_pids else "?"
+        parts.append(f"pkg:{state.package_name} pid:{pid_part}")
+    if state.level_mode == "min":
+        parts.append(f"level>={state.level_value}")
+    elif state.level_mode == "set":
+        parts.append(f"level:{''.join(sorted(state.level_set))}")
+    if state.tag_filter:
+        parts.append("tag")
+    if state.text_filter:
+        parts.append("text")
+    return " | ".join(parts)
+
+
+def help_text():
+    return (
+        "q quit\n"
+        "space pause/resume\n"
+        "p toggle package filter\n"
+        "P set package name\n"
+        "t set tag filter\n"
+        "l set level filter (e.g. W, E, I+, VDI)\n"
+        "/ set text filter\n"
+        "c clear filters (keeps package)\n"
+        "C clear all\n"
+        "? toggle help"
+    )
+
+
+def render(entries, state, console, title):
+    if state.show_help:
+        return Panel(Text(help_text()), title="logq help", border_style="magenta")
+
+    height = console.size.height
+    view_lines = max(5, height - 4)
+    entries_view = entries
+    if state.paused and state.paused_snapshot is not None:
+        entries_view = state.paused_snapshot
+
+    view = []
+    for entry in reversed(entries_view):
+        if matches(entry, state):
+            view.append(entry)
+        if len(view) >= view_lines:
+            break
+    view.reverse()
+
+    text = Text()
+    for entry in view:
+        text.append(format_entry(entry))
+        text.append("\n")
+    text.append(status_line(state, len(entries), len(view)), style="bold")
+    text.append("\n")
+    text.append("q quit  space pause  p pkg  P set pkg  t tag  l level  / text  c clear  ? help", style="dim")
+    return Panel(text, title=title, border_style="cyan")
+
+
+def prompt_input(live, terminal, prompt):
+    live.stop()
+    terminal.disable()
+    try:
+        return input(prompt).strip()
+    finally:
+        terminal.enable()
+        live.start()
+
+
+def find_latest_log(path):
+    if not path.exists():
+        return None
+    candidates = [p for p in path.iterdir() if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def read_existing(file_path, entries):
+    last_entry = None
+    with file_path.open("r", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            entry = parse_line(line, last_entry)
+            entries.append(entry)
+            last_entry = entry if entry.level != "?" else last_entry
+    return last_entry
+
+
+def follow_file(file_path, entries, state, stop_event):
+    last_entry = None
+    try:
+        f = file_path.open("r", errors="replace")
+    except OSError:
+        return None
+    try:
+        for line in f:
+            line = line.rstrip("\n")
+            entry = parse_line(line, last_entry)
+            entries.append(entry)
+            last_entry = entry if entry.level != "?" else last_entry
+        while not stop_event.is_set():
+            line = f.readline()
+            if line:
+                line = line.rstrip("\n")
+                entry = parse_line(line, last_entry)
+                entries.append(entry)
+                last_entry = entry if entry.level != "?" else last_entry
+                continue
+            time.sleep(0.05)
+            try:
+                stat = file_path.stat()
+                if stat.st_size < f.tell():
+                    f.close()
+                    f = file_path.open("r", errors="replace")
+                    last_entry = None
+            except OSError:
+                time.sleep(0.2)
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    return last_entry
+
+
+def key_reader(queue, stop_event):
+    fd = sys.stdin.fileno()
+    while not stop_event.is_set():
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            ch = os.read(fd, 1).decode("utf-8", errors="ignore")
+            queue.put(ch)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="logq")
+    parser.add_argument("file", nargs="?", help="log file (defaults to newest in logs/)")
+    parser.add_argument("--project", help="path to Android project root")
+    parser.add_argument("--buffer", type=int, default=10000, help="ring buffer size")
+    parser.add_argument("--package", help="package name to filter")
+    parser.add_argument("--no-package", action="store_true", help="disable package filter")
+    parser.add_argument("--level", help="level filter (e.g. W, E, I+, VDI)")
+    parser.add_argument("--tag", help="tag filter substring or /regex/")
+    parser.add_argument("--text", help="text filter substring or /regex/")
+    parser.add_argument("--pid-refresh", type=float, default=3.0, help="pid refresh seconds")
+    args = parser.parse_args()
+
+    set_project_root(args.project)
+
+    log_path = Path(args.file).expanduser() if args.file else None
+    if not log_path:
+        log_path = find_latest_log(log_dir())
+    if not log_path or not log_path.exists():
+        print("Log file not found. Provide a path or ensure logs/ has files.", file=sys.stderr)
+        return 1
+
+    state = State()
+    state.package_refresh_sec = args.pid_refresh
+
+    if args.package:
+        state.package_name = args.package
+        state.package_enabled = True
+    else:
+        pkg = app_id()
+        if pkg and not args.no_package:
+            state.package_name = pkg
+            state.package_enabled = True
+
+    if args.level:
+        mode, value, level_set = parse_level_filter(args.level)
+        state.level_mode = mode
+        state.level_value = value
+        state.level_set = level_set
+
+    if args.tag:
+        state.tag_filter, state.tag_is_regex = compile_filter(args.tag)
+
+    if args.text:
+        state.text_filter, state.text_is_regex = compile_filter(args.text)
+
+    entries = deque(maxlen=args.buffer)
+    read_existing(log_path, entries)
+
+    console = Console()
+    title = f"logq - {log_path.name}"
+
+    stop_event = Event()
+    key_queue = Queue()
+
+    term = TerminalMode()
+    term.enable()
+
+    reader_thread = Thread(target=key_reader, args=(key_queue, stop_event), daemon=True)
+    reader_thread.start()
+
+    follower_thread = Thread(
+        target=follow_file,
+        args=(log_path, entries, state, stop_event),
+        daemon=True,
+    )
+    follower_thread.start()
+
+    try:
+        with Live(render(entries, state, console, title), console=console, refresh_per_second=10) as live:
+            while not stop_event.is_set():
+                refresh_package_pids(state)
+
+                while not key_queue.empty():
+                    ch = key_queue.get_nowait()
+                    if ch in ("q", "Q"):
+                        stop_event.set()
+                        break
+                    if ch == " ":
+                        if not state.paused:
+                            state.paused = True
+                            state.paused_snapshot = list(entries)
+                        else:
+                            state.paused = False
+                            state.paused_snapshot = None
+                    elif ch == "?":
+                        state.show_help = not state.show_help
+                    elif ch == "c":
+                        state.level_mode = None
+                        state.level_value = None
+                        state.level_set = None
+                        state.tag_filter = None
+                        state.tag_is_regex = False
+                        state.text_filter = None
+                        state.text_is_regex = False
+                    elif ch == "C":
+                        state.level_mode = None
+                        state.level_value = None
+                        state.level_set = None
+                        state.tag_filter = None
+                        state.tag_is_regex = False
+                        state.text_filter = None
+                        state.text_is_regex = False
+                        state.package_enabled = False
+                        state.package_name = None
+                        state.package_pids = set()
+                    elif ch == "p":
+                        if state.package_name:
+                            state.package_enabled = not state.package_enabled
+                        else:
+                            pkg = prompt_input(live, term, "Package (empty to disable): ")
+                            if pkg:
+                                state.package_name = pkg
+                                state.package_enabled = True
+                    elif ch == "P":
+                        pkg = prompt_input(live, term, "Package (empty to disable): ")
+                        if pkg:
+                            state.package_name = pkg
+                            state.package_enabled = True
+                        else:
+                            state.package_enabled = False
+                    elif ch == "t":
+                        value = prompt_input(live, term, "Tag filter (substring or /regex/, empty to clear): ")
+                        state.tag_filter, state.tag_is_regex = compile_filter(value)
+                    elif ch == "l":
+                        value = prompt_input(live, term, "Level filter (e.g. W, E, I+, VDI, empty to clear): ")
+                        mode, level_value, level_set = parse_level_filter(value)
+                        state.level_mode = mode
+                        state.level_value = level_value
+                        state.level_set = level_set
+                    elif ch == "/":
+                        value = prompt_input(live, term, "Text filter (substring or /regex/, empty to clear): ")
+                        state.text_filter, state.text_is_regex = compile_filter(value)
+
+                if state.paused:
+                    time.sleep(0.1)
+                else:
+                    time.sleep(0.05)
+
+                live.update(render(entries, state, console, title))
+    finally:
+        stop_event.set()
+        term.disable()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
