@@ -1,6 +1,6 @@
-# Android CLI Tools
+# foodroid
 
-CLI helpers for Android development without Android Studio.
+foodroid is a set of CLI helpers for Android development without Android Studio IDE.
 
 ## Contents
 - `foodroid`: ADB + Gradle + logcat automation
