@@ -6,14 +6,22 @@ foodroid is a set of CLI helpers for Android development without Android Studio 
 - `foodroid`: ADB + Gradle + logcat automation
 - `logq`: interactive log viewer (tail + filters + color)
 
+## Dependencies
+Required (no Android Studio needed):
+- Python 3.10+
+- JDK 17 (for Android Gradle Plugin 8.x)
+- Android SDK **platform-tools** (`adb`)
+- An Android project with Gradle wrapper and standard `app/` module
+
+Optional / recommended:
+- `rich` (for `logq`) — install via `pip install -r requirements.txt`
+- `ANDROID_SDK_ROOT` or `ANDROID_HOME` env var (otherwise `local.properties` must define `sdk.dir`)
+- `ADB=/path/to/adb` if `adb` isn’t on PATH
+- Wireless debugging enabled on the device (for Wi‑Fi ADB)
+
 ## Assumptions
-- Python 3.10+ is available.
-- JDK 17 is installed for Android Gradle Plugin 8.x.
-- Android SDK is installed and either:
-  - `ANDROID_SDK_ROOT` or `ANDROID_HOME` is set, or
-  - your project has `local.properties` with `sdk.dir=...`.
-- `adb` is available in `$ANDROID_SDK_ROOT/platform-tools` or via `ADB=/path/to/adb`.
 - Your Android project uses a standard `app/` module with `app/build.gradle.kts` (KTS) or `app/build.gradle` (Groovy).
+- The Gradle wrapper (`./gradlew`) is present in the project root.
 
 ## Project Selection
 `foodroid` and `logq` target a project root using this order:
